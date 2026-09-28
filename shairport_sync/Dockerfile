@@ -42,18 +42,34 @@
 # the pinned NIXPKGS_REV plus the fact that essentially everything comes
 # prebuilt from cache.nixos.org.
 #
-# WHY NOT pkgsStatic:
-# pkgsStatic was originally wanted here for the obvious reason - a static
-# build would drop the ~343 MB glibc-based runtime closure this image
-# currently copies into /nix and make the final image dramatically
-# smaller. It was abandoned because something in this stack depends on
-# NSS: the image needs glibc's NSS "files" backend to resolve the
-# root/avahi users and netdev group that dbus's and avahi's own policy
-# files reference (see nix/default.nix's NSS notes - missing NSS files
-# were one of the 3.0.0 bugs). NSS resolves those by dlopen()ing
-# libnss_files at runtime, which a fully static binary cannot do, so
-# going static would reintroduce exactly that failure. The image size is
-# the price paid for that; it is not an oversight.
+# WHY NOT pkgsStatic (and the musl question):
+# pkgsStatic was originally wanted here for the obvious reason - dropping
+# the glibc-based runtime closure would make this image much smaller.
+# The reason recorded for abandoning it was "something depends on NSS".
+# That reason does NOT survive checking, and is worth writing down
+# accurately so nobody re-derives the wrong conclusion:
+#   - What this image actually needs is getpwnam/getgrnam for the
+#     root/avahi users and netdev group that dbus's and avahi's own policy
+#     files name (see nix/default.nix's NSS notes - missing /etc/passwd was
+#     one of the 3.0.0 bugs). It does NOT need pluggable NSS modules;
+#     nss-mdns is deliberately absent (see DOCS.md).
+#   - pkgsStatic is musl, and musl has no NSS mechanism at all - its
+#     getpwnam/getgrnam parse /etc/passwd and /etc/group directly, which
+#     is exactly the lookup this image performs. Confirmed that musl's
+#     libc.so exports getpwnam/getgrnam.
+# So the real objections are different ones:
+#   1. Nothing in a musl-based build of this stack is in cache.nixos.org -
+#      checked: pkgsMusl.dbus, pkgsMusl.avahi and pkgsMusl.shairport-sync
+#      all 404 there - so the entire stack would compile from source.
+#   2. Static specifically is also the wrong shape here: this image runs
+#      four separate daemons (dbus, avahi, nqptp, shairport-sync), so
+#      static linking duplicates their shared dependencies into each
+#      executable. Dynamically-linked pkgsMusl would very likely be
+#      smaller than pkgsStatic for that reason (musl's own closure is 4MB
+#      against glibc's 47MB).
+# Neither objection is fatal, so this remains a live option rather than a
+# closed decision; it is simply a much larger change than the trimming
+# already done, and it trades away every public cache hit.
 #
 # (Earlier versions of this file claimed both rationales were documented
 # in nix/default.nix and the README/DOCS.md. They were not - the README
