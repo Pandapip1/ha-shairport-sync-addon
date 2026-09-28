@@ -24,10 +24,15 @@ boot: auto
 # ffmpeg + openssl + shairport-sync + nqptp from source rather than hitting
 # a binary cache, on top of building avahi/dbus/s6 themselves via Nix.
 # See this repo's README for the CI/prebuilt-image alternative.
-# `timeout` documented as governing Docker daemon actions (start/stop), not
-# explicitly the image build - raised as a defensive margin since a first
-# install compiling ffmpeg could plausibly run long; unverified either way.
-timeout: 1800
+# `timeout` is the graceful-stop window (how long Supervisor waits for this
+# app to exit before killing it) - it does NOT govern the image build, so
+# there is no reason to inflate it for a slow first install.
+# Supervisor's schema caps this at 300; an earlier 1800 here was rejected
+# outright with "value must be at most 300 for dictionary value @
+# data['timeout']", which made the app silently invisible in the Add-on
+# Store (the repository loaded fine, the app just never appeared) - found
+# by actually installing this on a real HAOS Supervisor.
+timeout: 300
 
 # Maps Supervisor's working PulseAudio setup into the container so shairport-sync
 # can output to whatever sink the host (e.g. the 3.5mm jack) is using.
