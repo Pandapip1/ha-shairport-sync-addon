@@ -11,7 +11,7 @@
   # below and none upstream yet. The URL stays NixOS/nixpkgs because GitHub
   # serves fork-network commits from the upstream archive endpoint, after a
   # short propagation delay.
-  nixpkgsRev ? "16b0cbc9754e848a4ea46fccb9b511b7d0c9622b",
+  nixpkgsRev ? "961d0e2bd020a048f2fa555cb18839645103cf5e",
   pkgs ?
     import (builtins.fetchTarball "https://github.com/NixOS/nixpkgs/archive/${nixpkgsRev}.tar.gz")
       { },
@@ -73,6 +73,17 @@ let
       # pam_cap pulls linux-pam, which pulls systemd-minimal-libs.
       libcap = prev.libcap.override { usePam = false; };
 
+      # Only s6-svscan and the s6-supervise it spawns are ever run here, and
+      # eight of the binaries this drops link libexecline.
+      s6 = prev.s6.override {
+        execlineSupport = false;
+        components = [ "supervision" ];
+      };
+
+      # jq only reads three scalar fields out of options.json, so its regex
+      # engine is dead weight: oniguruma is 0.7MB of the closure.
+      jq = prev.jq.override { onigurumaSupport = false; };
+
       # flac's API docs need doxygen and graphviz, and graphviz -> gts -> glib.
       flac = prev.flac.override { enableDocs = false; };
 
@@ -95,9 +106,12 @@ let
         ];
       });
 
-      # Both ship optional glib binding libraries nothing here loads, whose
-      # existence alone puts glib (17MB) in the runtime closure.
-      avahi = prev.avahi.override { glibSupport = false; };
+      # Their optional glib and libevent binding libraries are never loaded here,
+      # but their existence alone puts glib (17MB) and libevent in the closure.
+      avahi = prev.avahi.override {
+        glibSupport = false;
+        libeventSupport = false;
+      };
       libpulseaudio = prev.libpulseaudio.override { glibSupport = false; };
     }
   );
@@ -118,8 +132,10 @@ let
     withSafeBitstreamReader = true;
   };
 
-  # pkgs.bash is bash-interactive, which brings readline and ncurses (~19MB).
-  bash = mpkgs.bashNonInteractive;
+  # One 1.5MB busybox in place of bash (4.0MB), coreutils (1.9MB, which also
+  # pulls gmp) and gnused (0.2MB), all of which only the generated run scripts
+  # use. The scripts are POSIX, so ash runs them unchanged.
+  busybox = mpkgs.busybox;
 
   shairportSync = mpkgs.shairport-sync.override {
     enableAirplay2 = true;
@@ -270,7 +286,7 @@ let
         if [ "$i" -eq 1 ] || [ $((i % 10)) -eq 0 ]; then
           echo "[wait] still waiting for $1 ($2)..."
         fi
-        ${mpkgs.coreutils}/bin/sleep 1
+        ${busybox}/bin/sleep 1
       done
     }
   '';
@@ -332,37 +348,37 @@ rec {
         # this shell runs, so they go in as tokens and are sed'd afterwards.
 
         cat > "$out"/etc/services.d/dbus/run <<'RUNEOF'
-        #!${bash}/bin/bash
+        #!${busybox}/bin/sh
         set -e
-        ${mpkgs.coreutils}/bin/mkdir -p /run/dbus
-        ${mpkgs.coreutils}/bin/rm -f /run/dbus/pid
+        ${busybox}/bin/mkdir -p /run/dbus
+        ${busybox}/bin/rm -f /run/dbus/pid
         echo "[dbus] starting"
         exec "@DBUS_DAEMON_BIN@" --config-file=/etc/dbus-1/system.conf --nofork --nopidfile
         RUNEOF
-        ${mpkgs.gnused}/bin/sed -i "s|@DBUS_DAEMON_BIN@|$DBUS_DAEMON_BIN|" "$out"/etc/services.d/dbus/run
+        ${busybox}/bin/sed -i "s|@DBUS_DAEMON_BIN@|$DBUS_DAEMON_BIN|" "$out"/etc/services.d/dbus/run
 
         cat > "$out"/etc/services.d/avahi/run <<'RUNEOF'
-        #!${bash}/bin/bash
+        #!${busybox}/bin/sh
         set -e
         ${waitForFn}
         wait_for "dbus system bus" /run/dbus/system_bus_socket
-        ${mpkgs.coreutils}/bin/mkdir -p /run/avahi-daemon
+        ${busybox}/bin/mkdir -p /run/avahi-daemon
         echo "[avahi] starting"
         # This build has no --no-chroot, and -f means "load THIS config file",
         # not "foreground" - which is already the default.
         exec "@AVAHI_DAEMON_BIN@" --no-drop-root --no-rlimits
         RUNEOF
-        ${mpkgs.gnused}/bin/sed -i "s|@AVAHI_DAEMON_BIN@|$AVAHI_DAEMON_BIN|" "$out"/etc/services.d/avahi/run
+        ${busybox}/bin/sed -i "s|@AVAHI_DAEMON_BIN@|$AVAHI_DAEMON_BIN|" "$out"/etc/services.d/avahi/run
 
         cat > "$out"/etc/services.d/nqptp/run <<'RUNEOF'
-        #!${bash}/bin/bash
+        #!${busybox}/bin/sh
         set -e
         echo "[nqptp] starting"
         exec ${lib.getExe mpkgs.nqptp}
         RUNEOF
 
         cat > "$out"/etc/services.d/shairport-sync/run <<'RUNEOF'
-        #!${bash}/bin/bash
+        #!${busybox}/bin/sh
         set -e
         ${waitForFn}
         wait_for "avahi" /run/avahi-daemon/pid
@@ -371,7 +387,7 @@ rec {
         # default-server; this image has no base image.
         export PULSE_SERVER=unix:/run/audio/pulse.sock
         # nqptp exposes no readiness file, so this is a fixed delay.
-        ${mpkgs.coreutils}/bin/sleep 2
+        ${busybox}/bin/sleep 2
 
         OPTIONS=/data/options.json
         AIRPLAY_NAME=$(${mpkgs.jq}/bin/jq -r '.airplay_name // "Home Assistant"' "$OPTIONS")
@@ -383,7 +399,7 @@ rec {
           PASSWORD_LINE="    password = \"$PASSWORD\";"
         fi
 
-        ${mpkgs.gnused}/bin/sed \
+        ${busybox}/bin/sed \
           -e "s|%%AIRPLAY_NAME%%|$AIRPLAY_NAME|" \
           -e "s|%%INTERPOLATION%%|$INTERPOLATION|" \
           -e "s|%%PASSWORD_LINE%%|$PASSWORD_LINE|" \

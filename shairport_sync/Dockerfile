@@ -12,7 +12,7 @@
 FROM nixos/nix:2.35.2 AS builder
 
 # Also nix/default.nix's default; passed explicitly so both stay in sync.
-ARG NIXPKGS_REV=16b0cbc9754e848a4ea46fccb9b511b7d0c9622b
+ARG NIXPKGS_REV=961d0e2bd020a048f2fa555cb18839645103cf5e
 
 # None of this musl stack is in cache.nixos.org, so without these the install
 # compiles dbus, avahi, libpulseaudio, ffmpeg and shairport-sync from source.
