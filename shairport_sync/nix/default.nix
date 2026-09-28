@@ -53,13 +53,18 @@
   list. avahi/dbus's install layout (the thing the `find`-based discovery
   below was hedging against) turned out fine as discovered.
 
-  What is still NOT verified, because it needs a real HA Supervisor
-  environment or a real Apple device, neither available where this was
-  built:
-    - Graceful shutdown under Supervisor's actual stop/restart sequence
-      (as opposed to a plain, untimed `docker stop` in testing).
+  It has since also run on a real Home Assistant OS 18.3 Supervisor
+  (aarch64), installed and driven through the Supervisor API: built by
+  Supervisor's own `docker buildx build`, started and stopped through its
+  lifecycle, with nqptp confirmed on the real host's UDP 319/320 and
+  shairport-sync on the real host's TCP 7000. Graceful shutdown - listed
+  here as unverified in 3.0.0 - measured 220-270ms. That round also caught
+  a `config.yaml` `timeout` value Supervisor rejects outright, which made
+  the app invisible in the Add-on Store; see CHANGELOG.md.
+
+  What is still NOT verified, because it needs a real Apple device:
     - An actual AirPlay 2 stream/pairing from a real iPhone/Mac.
-  Both are documented in DOCS.md rather than assumed away.
+  Documented in DOCS.md rather than assumed away.
 */
 {
   nixpkgsRev ? "55d33a38f82193676603b4b58572b8718d6623b7",

@@ -51,19 +51,28 @@ speaker that iPhones, iPads and Macs can stream to directly.
   made the app invisible in the Add-on Store entirely; see "Tested on a
   real Home Assistant Supervisor" and "What still hasn't been tested"
   below.
-- **The actual measured build cost turned out to be much smaller than
-  originally expected.** Only `shairport-sync` itself (about 30 seconds)
-  and the four small hand-written config files are compiled from source;
-  `avahi`, `dbus`, `s6`, `nqptp`, `jq`, `gnused`, and shairport-sync's own
-  `ffmpeg`/`openssl`/`soxr`/etc. build inputs all came straight from
-  `cache.nixos.org` as prebuilt binaries in the sandbox's own test build,
-  because none of those packages carry any override that would change
-  their derivation hash. The full end-to-end `docker build` (from a cold
-  Nix store) took under a minute, and the runtime closure copied into the
-  final image was 145 store paths / about 350 MB total. Your own build
-  time will vary with network speed and CPU, and a nixpkgs commit bump
-  could of course change what's cached, but "compiles ffmpeg from source"
-  - an earlier, unverified guess in this file - was wrong.
+- **The image is deliberately trimmed, and that trimming needs this
+  project's binary cache.** As built, the runtime closure is **75 store
+  paths / 178 MB**, giving a **259 MB** image - down from 145 paths /
+  343 MB / 504 MB before the trimming, all measured with `nix path-info
+  -S` and `docker images` rather than estimated. What was removed, and how,
+  is documented at the top of `nix/default.nix`; the short version is that
+  shairport-sync's `ffmpeg` dependency was dragging in video encoders
+  (x265, libaom, libvpx, svt-av1), `v4l-utils`, ALSA, Vulkan/VAAPI and a
+  subtitle/text-rendering stack that an audio-only AirPlay receiver can
+  never reach, `dbus` was pulling `systemd-minimal`, and `pkgs.bash` is
+  `bash-interactive` (readline + ncurses) in an image whose only scripts
+  are non-interactive.
+- **The cost of that:** overriding ffmpeg's features changes its
+  derivation hash, so the result is *not* in `cache.nixos.org` (verified
+  by querying it directly). Without a substituter that has it, every
+  install compiles ffmpeg from source **and runs its test suite**. The
+  Dockerfile therefore adds this project's own binary cache as an extra
+  substituter, alongside (not instead of) `cache.nixos.org`, with
+  `fallback = true` so an unreachable cache degrades to a slow build
+  rather than a failed install. With the cache reachable the whole closure
+  is a ~37 MB download; `shairport-sync` itself still compiles, since it
+  carries this app's own override combination.
 
 ## Installation
 
@@ -71,15 +80,17 @@ speaker that iPhones, iPads and Macs can stream to directly.
    add this repository, then find and install "Shairport Sync".
 2. There is no prebuilt image published for this app - Supervisor builds it
    locally from the Dockerfile in this repo the first time you install it.
-   As measured in the sandbox this was developed in (see above), most of
-   what gets built comes straight from `cache.nixos.org` as prebuilt
-   binaries, and only `shairport-sync` itself compiles from source (about
-   30 seconds on that machine) - so this should be noticeably lighter than
-   the "expect a full from-source build" warning in earlier versions of
-   this file, though a slower CPU, a slower connection to the binary cache,
-   or a nixpkgs commit bump that invalidates the cache could all still make
-   a real install slower than that. Updates after that only rebuild if you
-   bump `NIXPKGS_REV` in the Dockerfile.
+   Most of the closure comes prebuilt from `cache.nixos.org`, plus this
+   project's own cache for the trimmed ffmpeg (see above); `shairport-sync`
+   itself always compiles, since it carries this app's own override
+   combination. On a real HAOS 18.3 aarch64 Supervisor the build took
+   between about 6 and 12 minutes depending on cache locality and how
+   contended the machine was. Expect it to be slower on a Raspberry Pi,
+   and much slower if this project's cache is unreachable, since ffmpeg
+   then compiles from source and runs its test suite. Make sure you have a
+   few GB of transient free space for the build cache, not just 259 MB for
+   the image. Updates after that only rebuild if you bump `NIXPKGS_REV` in
+   the Dockerfile.
 3. Set your preferred `airplay_name` (and optionally a `password`) in the
    app's Configuration tab, then start it.
 4. On your iPhone/Mac, open Control Center's AirPlay picker (or the
@@ -228,8 +239,9 @@ there, by observing it happen:
 
 - **The repository adds and the app builds and installs.** Supervisor ran
   its own `docker buildx build --platform linux/arm64` against this
-  `Dockerfile` and reported `successfully installed`. The build took
-  **5 minutes 41 seconds** and produced a **504 MB** image.
+  `Dockerfile` and reported `successfully installed`. Measured twice: the
+  pre-trimming image took 5m41s to build and came out at 504 MB; the
+  trimmed one (see above) came out at **259 MB**. Both installed and ran.
 - **`cache.nixos.org` is reachable from inside Supervisor's build
   container** - the Nix build pulled prebuilt binaries normally, so no
   proxy or egress special-casing is needed.
@@ -245,9 +257,11 @@ there, by observing it happen:
   real `/data/options.json` through `jq` and rendered its own config.
 - **Graceful shutdown under Supervisor is fast.** Stopping the app through
   Supervisor's own lifecycle took **269 ms** end to end (its log going
-  from `Stopping app_...` to `Cleaning app_...`), because `s6-svscan` as
-  PID 1 acts on `SIGTERM` promptly. This was previously the main untested
-  risk here, since a large `timeout` would only ever delay a `SIGKILL`.
+  from `Stopping app_...` to `Cleaning app_...`), and **220 ms** on a
+  second run with the trimmed image, because `s6-svscan` as PID 1 acts on
+  `SIGTERM` promptly. This was previously the main untested risk here,
+  since a large `timeout` would only ever delay a `SIGKILL` - hence
+  `timeout: 30` in `config.yaml` rather than something inflated.
 
 That process also found a real bug that no amount of local container
 testing could have caught: `config.yaml` had `timeout: 1800`, but
@@ -257,12 +271,24 @@ while the repository itself loaded with no visible error. The only sign
 was a single Supervisor log line (`Can't read .../config.yaml: value must
 be at most 300 ... Got 1800`). See `CHANGELOG.md`.
 
-One correction to the build-cost numbers above, learned the same way:
-the *runtime closure* really is about 145 store paths / 343 MB as
-measured, but that is not the same as what a fresh install **downloads**.
-During the real Supervisor build the HAOS data partition grew by well
-over 2 GB, because Nix fetches each dependency's build closure too. Size
-the disk for the download, not for the final image.
+**Size the disk for the build, not for the image.** The image is 259 MB,
+but installing it moved the HAOS data partition by several GB. Broken
+down on the real device with `docker system df`, the bulk of that is
+**BuildKit's build cache** (3.7 GB after these builds, 2.7 GB of it
+reclaimable), because the Dockerfile's builder stage necessarily holds the
+full *build-time* Nix closure - every dependency's build inputs - not the
+178 MB runtime closure that actually ships. Supervisor does prune build
+cache (its `docker/manager.py` calls `prune_builds()`, logging "Prune
+stale builds"), so this is not a permanent leak, but it is transient
+headroom you need at install time. `docker buildx prune` reclaims it
+immediately if you have host access. For context, HA Core's own image on
+the same machine is 3.39 GB, so the add-on is not the dominant consumer
+either way.
+
+When the binary cache is reachable the build-time closure is largely
+skipped, since Nix substitutes the finished `containerRoot` and its
+runtime closure directly instead of realising the build dependencies -
+in testing that install fetched 69 NARs (~37 MB) and never built ffmpeg.
 
 ### What still hasn't been tested
 
