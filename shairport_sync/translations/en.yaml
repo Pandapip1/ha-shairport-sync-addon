@@ -1,0 +1,10 @@
+configuration:
+  airplay_name:
+    name: AirPlay name
+    description: The name this speaker advertises to iPhones/Macs (shown in the AirPlay picker).
+  password:
+    name: Password
+    description: Optional AirPlay password. Leave blank to allow anyone on the LAN to connect. AirPlay 1 only.
+  interpolation:
+    name: Interpolation
+    description: Audio resampling method. "soxr" sounds better but needs more CPU; use "basic" on very low-power hardware.

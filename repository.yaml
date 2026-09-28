@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/apps/repository#repository-configuration
+name: Shairport Sync app repository
+url: "https://github.com/gavinnjohn/ha-shairport-sync-addon"
+maintainer: Gavin John <gavinnjohn@gmail.com>

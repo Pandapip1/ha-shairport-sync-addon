@@ -1,0 +1,54 @@
+# https://developers.home-assistant.io/docs/apps/configuration#app-configuration
+name: Shairport Sync
+version: "3.0.0"
+slug: shairport_sync
+description: Expose an audio output on this device as an AirPlay 2 speaker
+url: "https://github.com/gavinnjohn/ha-shairport-sync-addon/tree/main/shairport_sync"
+arch:
+  - aarch64
+  - amd64
+# `init: false` because the final image is `FROM scratch` and the ENTRYPOINT
+# (nix/default.nix's containerRoot, /sbin/init -> s6-svscan) IS this app's own
+# init/PID 1 - Supervisor must not insert its own docker-init/tini in front of
+# it, the same reason this was `false` in the s6-overlay-based 1.0.0/2.0.0
+# builds (s6-overlay was already its own PID 1 there too).
+init: false
+startup: services
+boot: auto
+# NOTE: as of 3.0.0 this app is built entirely by Nix - not just
+# shairport-sync/nqptp (2.0.0), but avahi, dbus, and process supervision
+# (plain s6, no s6-overlay/bashio) too. There is no Alpine base image
+# underneath the final image at all (`FROM scratch`); see the Dockerfile and
+# nix/default.nix for the real build logic, and this repo's README for why.
+# First install is expected to be slow and heavy - it likely compiles
+# ffmpeg + openssl + shairport-sync + nqptp from source rather than hitting
+# a binary cache, on top of building avahi/dbus/s6 themselves via Nix.
+# See this repo's README for the CI/prebuilt-image alternative.
+# `timeout` documented as governing Docker daemon actions (start/stop), not
+# explicitly the image build - raised as a defensive margin since a first
+# install compiling ffmpeg could plausibly run long; unverified either way.
+timeout: 1800
+
+# Maps Supervisor's working PulseAudio setup into the container so shairport-sync
+# can output to whatever sink the host (e.g. the 3.5mm jack) is using.
+audio: true
+
+# AirPlay/mDNS discovery relies on LAN multicast, which does not cross Docker's
+# bridge network, so this app must bind directly to the host's network stack.
+host_network: true
+
+# Gives the app real-time scheduling access (adds SYS_NICE), which shairport-sync
+# needs to keep audio buffering jitter-free.
+realtime: true
+
+options:
+  airplay_name: "Home Assistant"
+  password: ""
+  interpolation: "soxr"
+
+schema:
+  airplay_name: str
+  password: str?
+  interpolation: "list(basic|soxr)"
+
+panel_icon: mdi:cast-audio
