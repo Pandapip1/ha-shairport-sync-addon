@@ -67,7 +67,31 @@
   Documented in DOCS.md rather than assumed away.
 */
 {
-  nixpkgsRev ? "55d33a38f82193676603b4b58572b8718d6623b7",
+  # TEMPORARY: this points at a nixpkgs *fork*, not upstream, because the
+  # trimming below needs package options that do not exist upstream yet:
+  #   avahi         glibSupport      (drops libavahi-glib/libavahi-gobject)
+  #   pulseaudio    glibSupport      (drops libpulse-mainloop-glib + gsettings)
+  #   pulseaudio    libOnly modules  (lib/pulse-* glob never matched
+  #                                   lib/pulseaudio, so a library-only build
+  #                                   shipped 67 daemon modules and a runtime
+  #                                   reference to fftw)
+  #   flac          enableDocs       (doxygen+graphviz -> gts -> glib, purely
+  #                                   to build flac's own API docs)
+  #   sqlite        checkTarget      (its test target builds ASan/UBSan
+  #                                   fuzzcheck binaries, which musl cannot)
+  #   shairport-sync glib gating     (glib is only needed for D-Bus/MPRIS,
+  #                                   but was an unconditional Linux input)
+  # Without these, each one has to be reproduced as a fragile `overrideAttrs`
+  # here instead. Bump this to an upstream commit once they land.
+  #
+  # The URL stays NixOS/nixpkgs even though this revision currently only
+  # exists on a fork: GitHub serves any commit in a fork network from the
+  # upstream repository's archive endpoint. Note there is a short
+  # propagation delay after a push - immediately after 28aa53e2 was pushed
+  # the upstream URL briefly 404'd while the fork's returned 200, then both
+  # returned an identical 52828869-byte tarball a moment later. So a 404
+  # here right after pushing means "wait", not "wrong URL".
+  nixpkgsRev ? "8894653cb54b428b9b953b3418496c8cf1f53330",
   pkgs ?
     import (builtins.fetchTarball "https://github.com/NixOS/nixpkgs/archive/${nixpkgsRev}.tar.gz")
       { },
@@ -75,6 +99,236 @@
 
 let
   inherit (pkgs) lib;
+
+  # --- Everything in the image is built against musl, not glibc ---
+  # glibc's store path is 47MB, of which only about 5MB is the libraries
+  # actually loaded: lib/gconv is 21MB (255 charset-conversion modules),
+  # share/i18n 17MB and share/locale 5MB. musl's whole closure is 4MB and
+  # has no gconv or locale tree at all.
+  #
+  # Why this is safe despite this image needing name lookups: what it
+  # actually needs is getpwnam/getgrnam for the root/avahi users and netdev
+  # group that dbus's and avahi's own policy files name (see the NSS notes
+  # further down). It does NOT need pluggable NSS modules - nss-mdns is
+  # deliberately absent. musl has no NSS mechanism at all; its
+  # getpwnam/getgrnam parse /etc/passwd and /etc/group directly, which is
+  # exactly the lookup performed here, so the static /etc/passwd and
+  # /etc/group written below still satisfy it. (/etc/nsswitch.conf is a
+  # glibc concept and is simply ignored by musl; it is kept so the same
+  # container root still works if this is ever pointed back at glibc.)
+  #
+  # The price, measured rather than assumed: none of this is in
+  # cache.nixos.org - pkgsMusl.dbus, pkgsMusl.avahi and
+  # pkgsMusl.shairport-sync all 404 there - so the whole stack compiles
+  # from source and the image depends entirely on this project's own binary
+  # cache (see the Dockerfile's extra-substituters).
+  #
+  # Dynamic musl rather than pkgsStatic deliberately: this image runs four
+  # separate daemons (dbus, avahi, nqptp, shairport-sync), so static
+  # linking would duplicate their shared dependencies into every
+  # executable. Static would also make the dbus override below impossible
+  # to apply after the fact - nixpkgs' replaceDependencies is a byte-level
+  # sed over the NAR (see pkgs/build-support/replace-direct-dependencies.nix),
+  # so it can only repoint real dynamic references, never relink code that
+  # has been copied into a static binary.
+  #
+  # dbus's `enableSystemd` still defaults on even under musl (checked:
+  # nixpkgs reports systemdMinimal as available on musl, and pkgsMusl.dbus
+  # still lists it), and it pulls systemd-minimal + systemd-minimal-libs
+  # (38MB) purely for systemd activation and journal logging, neither of
+  # which is reachable in this image - dbus runs under s6 with the
+  # activation directives stripped out of system.conf. Overriding it in an
+  # overlay rather than per-consumer means avahi and libpulseaudio, which
+  # link libdbus too, agree with our daemon automatically.
+  mpkgs = pkgs.pkgsMusl.extend (
+    _final: prev: {
+      # x11Support defaults on for Linux and exists only for dbus-launch's X11
+      # autolaunch, which needs an X display. This image has none, and dbus is
+      # started explicitly by s6 as a system bus, so autolaunch can never fire.
+      # It was pulling libx11 (4MB) + libxcb (3MB) into the closure.
+      # NOT overriding python3 to python3Minimal here, tempting as it looks:
+      # dbus's meson does an unconditional `find_program('python3')` for three
+      # scripts that import nothing beyond `os`, and python3Minimal has one
+      # buildInput (bash) against full CPython's sixteen. But dbus also takes
+      # meson, and nixpkgs builds meson as a python3.pkgs.buildPythonApplication,
+      # so full CPython - and with it sqlite - is in the build regardless.
+      # Pointing dbus at the minimal interpreter therefore built *both*:
+      # evaluating dbus's nativeBuildInputs listed meson-1.10.2 and
+      # python3-minimal-3.14.7 side by side. Reusing the interpreter meson
+      # already forces is strictly cheaper.
+      #
+      # AppArmor mediation, audit logging and capability dropping are all
+      # unreachable here: this container has no AppArmor policy, no auditd to
+      # log to, and dbus already runs as root under s6 with no privilege to
+      # drop. They were pulling libapparmor, audit and libcap-ng (~3MB).
+      dbus = prev.dbus.override {
+        enableSystemd = false;
+        x11Support = false;
+        apparmorSupport = false;
+        libauditSupport = false;
+        capabilitySupport = false;
+      };
+
+      # Nothing in this image ships Python - it is here purely because meson
+      # is a python3.pkgs.buildPythonApplication, and dbus/avahi/libpulseaudio
+      # are all meson-built. So CPython is pure build cost, and a large one:
+      # full CPython pulls sixteen buildInputs and compiles its whole stdlib
+      # and test suite.
+      #
+      # Note this MUST be an overlay entry rather than `meson.override
+      # { python3 = ...; }` - verified that the latter is a no-op, producing a
+      # byte-identical meson derivation, because `python3.pkgs` stays bound to
+      # the original interpreter regardless of the argument. Overriding
+      # `python3` in the overlay does reach meson (different drv hash).
+      #
+      # Switching off individual modules, rather than `withMinimalDeps = true`
+      # plus re-adds. That deny-by-default shape was tried and is not
+      # workable: cpython gates
+      #     bzip2  libffi  libuuid  ncurses  xz  zlib
+      # solely on `!withMinimalDeps`, with no per-module flag, so there is no
+      # way to put zlib back - and every Python wheel is a deflate-compressed
+      # zip, so the build died in flit-core with
+      #     RuntimeError: Compression requires the (missing) zlib module
+      # That is also why python3Minimal is a bootstrap-only interpreter: it
+      # cannot build wheels at all.
+      #
+      # (An earlier attempt at the same shape failed differently, on an
+      # output reference check - withMinimalDeps sets allowedReferenceNames
+      # to ["bashNonInteractive"], and cpython's passthru re-override used to
+      # drop that argument because it filtered inputs to scalar types. The
+      # pinned revision fixes that, but the zlib problem above is
+      # independent of it and fatal on its own.)
+      # CPython is here only as a *build* tool - meson is a Python
+      # application, and ninja's unconditional docs phase drags in asciidoc,
+      # which is another one. Verified it is build-time only rather than
+      # assumed: `nix-store -qR` on the built containerRoot matches zero
+      # python paths out of 140, so none of this reaches the image. What it
+      # costs is build time and build-host disk, which is worth cutting
+      # anyway since almost everything compiled here is this subtree.
+      #
+      # Stated additively, the same way as ffmpeg above: withMinimalDeps
+      # turns off every optional dependency at once (sqlite - whose test
+      # target builds ASan/UBSan fuzzcheck binaries musl cannot;
+      # gdbm; readline+ncurses; bzip2; xz; zstd; libuuid; mpdecimal; bluez;
+      # tzdata; mailcap/mimetypes) and also flips the strip* flags
+      # (stripConfig, stripTests, stripIdlelib, stripTkinter) plus
+      # rebuildBytecode and includeSiteCustomize, none of which a build-only
+      # interpreter needs. Then only what the build tooling genuinely needs
+      # comes back.
+      #
+      # This shape is only possible as of the pinned revision: before it,
+      # the optional-dependency flags were readable but not independently
+      # settable, because cpython's passthru `inputs'` filter allowlisted
+      # scalar types only and silently dropped allowedReferenceNames.
+      python3 = prev.python3.override {
+        withMinimalDeps = true;
+        # zlib is not optional in practice: flit-core fails outright with
+        # "RuntimeError: Compression requires the (missing) zlib module"
+        # when building a wheel without it.
+        withZlib = true;
+        # expat (xml.parsers.expat, and so xml.etree) and libffi (ctypes)
+        # are re-enabled as cheap insurance for the build tooling rather
+        # than from a measured failure; both are already in this build for
+        # other reasons (dbus needs expat) and neither reaches the image.
+        withExpat = true;
+        withLibffi = true;
+        # withOpenssl (_ssl/_hashlib) is deliberately NOT re-enabled. Nothing
+        # here needs TLS - every build is offline - and hashlib still works
+        # without it, since CPython keeps built-in _md5/_sha1/_sha2/_sha3.
+        # There is also a latent nixpkgs wart in the way: allowedReferenceNames
+        # maps a name to `inputs.<name>`, which is a package's *default*
+        # output. openssl's outputs are [ bin dev out man ], so that yields
+        # openssl-bin while CPython's _ssl module links libssl from openssl.out
+        # - the allowlist entry would not match the actual reference and the
+        # check would reject the dependency it was asked to permit. Any
+        # multi-output dependency whose lib output is not the default output
+        # has the same problem; zlib, expat and libffi happen not to.
+        # withMinimalDeps sets allowedReferences to bashNonInteractive only,
+        # which is the point of it: it makes an accidental dependency a build
+        # failure rather than a silent closure member. The four re-enabled
+        # deps have to be declared here too, or the reference check rejects
+        # the very thing that was just asked for.
+        allowedReferenceNames = [
+          "bashNonInteractive"
+          "zlib"
+          "expat"
+          "libffi"
+        ];
+      };
+
+      # speexdsp (a libpulseaudio dependency, used for resampling) defaults
+      # to fftw for its FFT, and fftw needs gfortran - which does not build
+      # under musl at all, its stage1-gcc failing outright. That was the
+      # single reason the whole musl build died. speexdsp has a real flag
+      # for this and falls back to its own bundled FFT, so no override of
+      # libpulseaudio's inputs is needed. Traced with `nix why-depends
+      # --derivation`: shairport-sync -> libpulseaudio -> speexdsp ->
+      # fftw-single -> gfortran.
+      speexdsp = prev.speexdsp.override { withFftw3 = false; };
+
+
+      # libcap builds a PAM module (pam_cap) by default, and linux-pam drags
+      # in systemd-minimal-libs. This image has no login path of any kind,
+      # so PAM is unreachable; this was the last build-time reason systemd
+      # appeared in the plan at all (libpulseaudio propagates libcap, and
+      # libcap -> linux-pam -> systemd-minimal-libs).
+      libcap = prev.libcap.override { usePam = false; };
+
+      # flac depends on doxygen and graphviz purely to build its own API
+      # documentation, and graphviz drags in gts, which drags in glib. That
+      # was the real reason glib's whole closure still had to be *built*
+      # after the binding libraries above were disabled - traced with
+      # `nix why-depends --derivation`:
+      #   shairport-sync -> libpulseaudio -> libsndfile -> flac
+      #     -> graphviz -> gts -> glib
+      # Nothing here consumes flac's documentation, so turn it off and drop
+      # the two doc tools.
+      flac = prev.flac.override { enableDocs = false; };
+      # Point every ffmpeg consumer (shairport-sync defaults to the full
+      # ffmpeg) at the trimmed headless build described further down.
+      # The override flags above only control *external* libraries. ffmpeg
+      # still compiles its entire built-in component set - every native
+      # decoder, encoder, muxer, demuxer, parser, protocol and filter - which
+      # is why libavcodec.so alone is 15.6MB of the lib output.
+      #
+      # shairport-sync needs exactly two decoders, both native: reading its
+      # sources it references only AV_CODEC_ID_AAC and AV_CODEC_ID_ALAC.
+      # nixpkgs' ffmpeg exposes no extraConfigureFlags escape hatch, so this
+      # is the one place an overrideAttrs is still required. Order matters
+      # and works in our favour: appending puts --disable-everything after
+      # the generated flag list, clearing the component set, and the
+      # --enable-decoder/--enable-parser that follow re-add just what is
+      # used. Nothing here touches the libraries themselves (swresample and
+      # friends are not "components"), so shairport-sync's linkage is
+      # unaffected.
+      ffmpeg = (prev.ffmpeg-headless.override ffmpegTrimFlags).overrideAttrs (o: {
+        configureFlags = (o.configureFlags or [ ]) ++ [
+          "--disable-everything"
+          "--enable-decoder=aac,aac_fixed,alac"
+          "--enable-parser=aac"
+        ];
+      });
+
+      # avahi and libpulseaudio each ship optional glib *binding* libraries
+      # (libavahi-glib.so, libpulse-mainloop-glib.so) that nothing in this
+      # image ever loads, but whose mere existence puts glib - 17MB - into
+      # the runtime closure. Checked before removing: `ldd` shows neither
+      # avahi-daemon nor shairport-sync with glib in DT_NEEDED, and
+      # shairport-sync has no glib store reference at all (glib is one of
+      # its buildInputs, but build-time only), so those two binding libs
+      # were the only thing keeping glib alive.
+      #
+      # Both the feature flag and the buildInput are removed: disabling the
+      # feature alone would still build glib and can still leak references
+      # through generated pkg-config files.
+      # Dropping glib also drops dconf (pulseaudio only referenced it by
+      # interpolating it into a gsettings wrapper script) and, via the
+      # pinned revision's libOnly fix, the 67 daemon modules a library-only
+      # build used to ship - which is what referenced fftw.
+      avahi = prev.avahi.override { glibSupport = false; };
+      libpulseaudio = prev.libpulseaudio.override { glibSupport = false; };
+    }
+  );
 
   # --- Runtime-closure trimming (measured; see DOCS.md for before/after) ---
   # shairport-sync depends on ffmpeg for AirPlay 2's AAC decoding, and that
@@ -105,76 +359,64 @@ let
   # references would only make shairport-sync fail to start at runtime.
   # Reference-stripping helps for paths that leak in as strings
   # (pkg-config files, embedded build flags), not for actual dynamic links.
-  ffmpegAudioOnly = pkgs.ffmpeg-headless.override {
-    withX264 = false;
-    withX265 = false;
-    withVpx = false;
-    withAom = false;
-    withSvtav1 = false;
-    withDav1d = false;
-    withTheora = false;
-    withWebp = false;
-    withOpenjpeg = false;
-    withBluray = false;
-    withOpenmpt = false;
-    withSrt = false;
-    withRist = false;
-    withVidStab = false;
-    # Video capture: pulls v4l-utils, which was the last thing dragging
-    # systemd-minimal-libs into the closure (found with `nix why-depends`:
-    # containerRoot -> shairport-sync -> ffmpeg-lib -> v4l-utils ->
-    # systemd-minimal-libs).
-    withV4l2 = false;
-    # ALSA: this app outputs via PulseAudio only (enableAlsa = false on
-    # shairport-sync below), so ffmpeg's own ALSA support is dead weight.
-    withAlsa = false;
-    # GPU/hardware video paths - meaningless for an audio-only receiver.
-    withVulkan = false;
-    withVaapi = false;
-    withDrm = false;
-    withOpencl = false;
-    # Subtitle and text rendering (drawtext filter and friends).
-    withAss = false;
-    withFontconfig = false;
-    withFreetype = false;
-    withFribidi = false;
-    withHarfbuzz = false;
-    withZvbi = false;
-    # Remaining non-audio container/protocol extras.
-    withOpenapv = false;
-    withSsh = false;
+  ffmpegTrimFlags = {
+    # nixpkgs' ffmpeg groups its optional-dependency defaults into three
+    # tiers - withHeadlessDeps, withSmallDeps, withFullDeps - and nearly
+    # every `with*` flag defaults to one of them. ffmpeg-headless is exactly
+    # the variant that sets withHeadlessDeps, so turning that one flag off is
+    # subtractive in a single move. It takes out:
+    #   - the external libraries: x264/x265/vpx/aom/svt-av1/dav1d/theora/webp/
+    #     openjpeg/bluray/openmpt/srt/rist/vid.stab (video codecs and
+    #     containers an audio-only receiver cannot reach); speex/opus/vorbis/
+    #     mp3lame (AirPlay 2 streams AAC and ALAC, whose decoders are native
+    #     to ffmpeg - and speex in particular pulled fftw-single, which needs
+    #     gfortran, which does not build under musl); gnutls (and with it
+    #     p11-kit, unbound and libunistring - AirPlay 2's own crypto is done
+    #     by openssl, which stays); lzma/xml2/bzlib; the drawtext/subtitle
+    #     stack (ass, fontconfig, freetype, fribidi, harfbuzz, zvbi); v4l2
+    #     (which was the last thing dragging in systemd-minimal-libs); alsa
+    #     (this app outputs via PulseAudio only); vulkan/vaapi/drm/opencl;
+    #     amf and the nvidia encode/decode stack; and cuda-llvm, which was
+    #     pulling buildPackages.clang.cc and with it the whole of LLVM, the
+    #     largest derivation in this build.
+    #   - the non-library feature payload: network, gmp, zimg, iconv, soxr,
+    #     zlib, hardcoded tables, pixelutils.
+    #   - all four documentation flags (this is where asciidoc entered).
+    #   - the ffmpeg/ffprobe/ffplay executables - this app calls the
+    #     libraries directly, so skipping them also saves the link step.
+    # Only what this app genuinely links is then switched back on below.
+    #
+    # Stated additively like this, anything nixpkgs later adds to those tiers
+    # stays off by default rather than silently reappearing - which an
+    # explicit list of ~50 `= false` entries could not promise.
+    withHeadlessDeps = false;
+
+    # The libraries shairport-sync actually links, and nothing else.
+    # Verified against the built binary rather than assumed: its DT_NEEDED
+    # entries name exactly libavcodec.so.63, libavformat.so.63,
+    # libavutil.so.61 and libswresample.so.7 - never libavfilter (5.3MB),
+    # libswscale (1.3MB) or libavdevice (0.1MB).
+    buildAvcodec = true;
+    buildAvformat = true;
+    buildAvutil = true;
+    buildSwresample = true;
+
+    # Switched back on deliberately: withSafeBitstreamReader is a
+    # bounds-checking safety feature rather than a feature payload, and this
+    # code decodes data arriving off the network.
+    withSafeBitstreamReader = true;
   };
-
-  # dbus's `enableSystemd` defaults on, which puts systemd-minimal (33MB)
-  # plus systemd-minimal-libs (5MB) into the runtime closure purely so dbus
-  # can do systemd service activation and journal logging. This image runs
-  # dbus under s6 with the activation directives deliberately stripped from
-  # system.conf (see dbusSystemConf below) and ships no systemd at all, so
-  # none of that is reachable at runtime.
-  dbusNoSystemd = pkgs.dbus.override { enableSystemd = false; };
-
-  # Overriding dbus for *our* daemon is not enough on its own: avahi (and
-  # libpulseaudio) link libdbus too, and `nix why-depends` showed
-  # systemd-minimal surviving via exactly that route -
-  # containerRoot -> avahi-0.8 -> dbus-1.16.2-lib (stock) -> systemd-minimal.
-  # Overriding each of those consumers would force avahi and libpulseaudio
-  # to rebuild from source; instead the stock libdbus is swapped out across
-  # the whole closure at the end with nixpkgs' own `replaceDependencies`
-  # (pkgs/build-support/replace-dependencies.nix), which rewrites an
-  # already-built tree's references with no rebuild at all. See the
-  # `containerRoot` definition at the bottom of this file.
-  # Its documented requirement - old and new dependency names must be the
-  # same length - holds here, since an override does not change the name
-  # (both are `dbus-1.16.2-lib`).
 
   # The generated service `run` scripts are plain non-interactive shell
   # scripts, but `pkgs.bash` is bash-interactive (confirmed by evaluating
   # it: bash-interactive-5.3p15), which drags readline and ncurses along
   # for ~19MB combined. bashNonInteractive is the same bash without them.
-  bash = pkgs.bashNonInteractive;
+  bash = mpkgs.bashNonInteractive;
 
-  shairportSync = pkgs.shairport-sync.override {
-    ffmpeg = ffmpegAudioOnly;
+  # glib is no longer filtered out by hand: at the pinned revision nixpkgs
+  # gates shairport-sync's glib on (enableDbus || enableMpris), both false
+  # below, so it is simply never an input.
+  shairportSync = mpkgs.shairport-sync.override {
     enableAirplay2 = true;
     enableAvahi = true;
     enablePulse = true;
@@ -182,6 +424,16 @@ let
     enableMetadata = true;
     enableStdout = true;
     enablePipe = true;
+    # WARNING before turning either of these on: nixpkgs' shairport-sync has
+    # an unconditional postPatch that rewrites G_BUS_TYPE_SYSTEM to
+    # G_BUS_TYPE_SESSION in dbus-service.c and mpris-service.c (4 real
+    # occurrences - checked against the source, it is not a no-op). This
+    # image runs a *system* bus only - see dbusSystemConf's `<type>system</type>`
+    # and /run/dbus/system_bus_socket - and starts nothing that would provide
+    # a session bus. So enabling either flag here yields a shairport-sync
+    # compiled to look for a session bus that does not exist in this
+    # container: it would fail to connect while dbus itself appears healthy.
+    # Undo that postPatch as well if these are ever wanted.
     enableDbus = false;
     enableMpris = false;
     enableMqttClient = false;
@@ -195,14 +447,14 @@ let
     enableLibdaemon = false;
   };
 
-  nqptpPkg = pkgs.nqptp;
+  nqptpPkg = mpkgs.nqptp;
 
   # --- Hand-authored configs, adapted from the real upstream templates ---
   # (dbus's bus/system.conf.in and avahi's avahi-daemon/avahi-dbus.conf.in
   # and avahi-daemon/avahi-daemon.conf, fetched from their own repos while
   # writing this - not reconstructed from memory).
 
-  dbusSystemConf = pkgs.writeText "system.conf" ''
+  dbusSystemConf = mpkgs.writeText "system.conf" ''
     <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
      "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
     <busconfig>
@@ -244,7 +496,7 @@ let
 
   # Fallback avahi dbus policy, used only if the real one can't be located
   # inside the built avahi package at container-root build time.
-  avahiDbusPolicyFallback = pkgs.writeText "avahi-dbus.conf" ''
+  avahiDbusPolicyFallback = mpkgs.writeText "avahi-dbus.conf" ''
     <!DOCTYPE busconfig PUBLIC
               "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
               "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -274,23 +526,23 @@ let
   # privilege (avahi runs with --no-drop-root, dbus's "run as root" is a
   # no-op since we start as root) - these entries exist purely so the NSS
   # lookups those daemons perform along the way can succeed.
-  nssPasswd = pkgs.writeText "passwd" ''
+  nssPasswd = mpkgs.writeText "passwd" ''
     root:x:0:0:root:/root:/bin/sh
     avahi:x:999:999:Avahi mDNS daemon:/var/empty:/bin/false
   '';
 
-  nssGroup = pkgs.writeText "group" ''
+  nssGroup = mpkgs.writeText "group" ''
     root:x:0:
     avahi:x:999:
     netdev:x:1000:
   '';
 
-  nsswitchConf = pkgs.writeText "nsswitch.conf" ''
+  nsswitchConf = mpkgs.writeText "nsswitch.conf" ''
     passwd: files
     group: files
   '';
 
-  avahiDaemonConf = pkgs.writeText "avahi-daemon.conf" ''
+  avahiDaemonConf = mpkgs.writeText "avahi-daemon.conf" ''
     [server]
     use-ipv4=yes
     use-ipv6=yes
@@ -310,7 +562,7 @@ let
     [rlimits]
   '';
 
-  shairportSyncConfTemplate = pkgs.writeText "shairport-sync.conf.template" ''
+  shairportSyncConfTemplate = mpkgs.writeText "shairport-sync.conf.template" ''
     // Rendered at container startup by /etc/services.d/shairport-sync/run
     // from the app's options (read via jq from /data/options.json - no
     // bashio in this image). AirPlay 2 is compiled in (see
@@ -364,7 +616,7 @@ let
         if [ "$i" -eq 1 ] || [ $((i % 10)) -eq 0 ]; then
           echo "[wait] still waiting for $1 ($2)..."
         fi
-        ${pkgs.coreutils}/bin/sleep 1
+        ${mpkgs.coreutils}/bin/sleep 1
       done
     }
   '';
@@ -372,25 +624,28 @@ let
 in
 rec {
   inherit shairportSync nqptpPkg;
+  # Exposed for introspection/testing (e.g. asserting that the overlay's
+  # dbus and ffmpeg really are what every consumer resolves to).
+  inherit mpkgs;
 
-  containerRootUnpatched =
-    pkgs.runCommand "shairport-sync-container-root"
+  containerRoot =
+    mpkgs.runCommand "shairport-sync-container-root"
       {
-        nativeBuildInputs = [ pkgs.findutils ];
+        nativeBuildInputs = [ mpkgs.findutils ];
       }
       ''
         set -eu
 
         # --- Discover the real binary/config paths inside the already-built
         # avahi/dbus derivations, rather than guessing bin/ vs sbin/. ---
-        AVAHI_DAEMON_BIN="$(find ${pkgs.avahi} -type f -name avahi-daemon | head -n1)"
-        DBUS_DAEMON_BIN="$(find ${dbusNoSystemd} -type f -name dbus-daemon | head -n1)"
+        AVAHI_DAEMON_BIN="$(find ${mpkgs.avahi} -type f -name avahi-daemon | head -n1)"
+        DBUS_DAEMON_BIN="$(find ${mpkgs.dbus} -type f -name dbus-daemon | head -n1)"
         if [ -z "$AVAHI_DAEMON_BIN" ] || [ -z "$DBUS_DAEMON_BIN" ]; then
           echo "ERROR: could not locate avahi-daemon or dbus-daemon binary in the built packages" >&2
           exit 1
         fi
 
-        AVAHI_DBUS_POLICY="$(find ${pkgs.avahi} -type f -name 'avahi-dbus.conf' 2>/dev/null | head -n1)"
+        AVAHI_DBUS_POLICY="$(find ${mpkgs.avahi} -type f -name 'avahi-dbus.conf' 2>/dev/null | head -n1)"
         if [ -z "$AVAHI_DBUS_POLICY" ]; then
           echo "NOTE: avahi package did not ship its own avahi-dbus.conf where expected; using the fallback bundled in this repo's nix/default.nix" >&2
           AVAHI_DBUS_POLICY="${avahiDbusPolicyFallback}"
@@ -423,13 +678,13 @@ rec {
         cp "${nssGroup}" "$out"/etc/group
         cp "${nsswitchConf}" "$out"/etc/nsswitch.conf
 
-        ln -s "${lib.getExe pkgs.nqptp}" "$out"/usr/local/bin/nqptp
+        ln -s "${lib.getExe mpkgs.nqptp}" "$out"/usr/local/bin/nqptp
         ln -s "${lib.getExe shairportSync}" "$out"/usr/local/bin/shairport-sync
 
         # PID 1: s6-svscan supervising /etc/services.d, restarting anything
         # that exits (its default behavior for any dir it scans - no per-service
         # "type" file needed, unlike the s6-rc layer this deliberately skips).
-        ln -s "${pkgs.s6}/bin/s6-svscan" "$out"/sbin/init
+        ln -s "${mpkgs.s6}/bin/s6-svscan" "$out"/sbin/init
 
         # NOTE ON QUOTING: every heredoc below uses a QUOTED delimiter
         # (<<'RUNEOF') so bash writes its body to disk byte-for-byte with
@@ -451,12 +706,12 @@ rec {
         cat > "$out"/etc/services.d/dbus/run <<'RUNEOF'
         #!${bash}/bin/bash
         set -e
-        ${pkgs.coreutils}/bin/mkdir -p /run/dbus
-        ${pkgs.coreutils}/bin/rm -f /run/dbus/pid
+        ${mpkgs.coreutils}/bin/mkdir -p /run/dbus
+        ${mpkgs.coreutils}/bin/rm -f /run/dbus/pid
         echo "[dbus] starting"
         exec "@DBUS_DAEMON_BIN@" --config-file=/etc/dbus-1/system.conf --nofork --nopidfile
         RUNEOF
-        ${pkgs.gnused}/bin/sed -i "s|@DBUS_DAEMON_BIN@|$DBUS_DAEMON_BIN|" "$out"/etc/services.d/dbus/run
+        ${mpkgs.gnused}/bin/sed -i "s|@DBUS_DAEMON_BIN@|$DBUS_DAEMON_BIN|" "$out"/etc/services.d/dbus/run
 
         # --- avahi (waits for dbus's socket) ---
         cat > "$out"/etc/services.d/avahi/run <<'RUNEOF'
@@ -464,7 +719,7 @@ rec {
         set -e
         ${waitForFn}
         wait_for "dbus system bus" /run/dbus/system_bus_socket
-        ${pkgs.coreutils}/bin/mkdir -p /run/avahi-daemon
+        ${mpkgs.coreutils}/bin/mkdir -p /run/avahi-daemon
         echo "[avahi] starting"
         # No `--no-chroot` (this nixpkgs build of avahi-daemon doesn't
         # accept it - `avahi-daemon --help` doesn't list it) and no `-f`
@@ -474,14 +729,14 @@ rec {
         # running this and reading `avahi-daemon --help`, not assumed.
         exec "@AVAHI_DAEMON_BIN@" --no-drop-root --no-rlimits
         RUNEOF
-        ${pkgs.gnused}/bin/sed -i "s|@AVAHI_DAEMON_BIN@|$AVAHI_DAEMON_BIN|" "$out"/etc/services.d/avahi/run
+        ${mpkgs.gnused}/bin/sed -i "s|@AVAHI_DAEMON_BIN@|$AVAHI_DAEMON_BIN|" "$out"/etc/services.d/avahi/run
 
         # --- nqptp (no dependencies - just needs to be up before shairport-sync) ---
         cat > "$out"/etc/services.d/nqptp/run <<'RUNEOF'
         #!${bash}/bin/bash
         set -e
         echo "[nqptp] starting"
-        exec ${lib.getExe pkgs.nqptp}
+        exec ${lib.getExe mpkgs.nqptp}
         RUNEOF
 
         # --- shairport-sync (waits for avahi, nqptp, and the Supervisor's
@@ -506,19 +761,19 @@ rec {
         # 319/320 before shairport-sync starts expecting it. See DOCS.md -
         # this is a fixed delay, not a real readiness check, because nqptp
         # doesn't expose one.
-        ${pkgs.coreutils}/bin/sleep 2
+        ${mpkgs.coreutils}/bin/sleep 2
 
         OPTIONS=/data/options.json
-        AIRPLAY_NAME=$(${pkgs.jq}/bin/jq -r '.airplay_name // "Home Assistant"' "$OPTIONS")
-        INTERPOLATION=$(${pkgs.jq}/bin/jq -r '.interpolation // "soxr"' "$OPTIONS")
-        PASSWORD=$(${pkgs.jq}/bin/jq -r '.password // ""' "$OPTIONS")
+        AIRPLAY_NAME=$(${mpkgs.jq}/bin/jq -r '.airplay_name // "Home Assistant"' "$OPTIONS")
+        INTERPOLATION=$(${mpkgs.jq}/bin/jq -r '.interpolation // "soxr"' "$OPTIONS")
+        PASSWORD=$(${mpkgs.jq}/bin/jq -r '.password // ""' "$OPTIONS")
 
         PASSWORD_LINE=""
         if [ -n "$PASSWORD" ]; then
           PASSWORD_LINE="    password = \"$PASSWORD\";"
         fi
 
-        ${pkgs.gnused}/bin/sed \
+        ${mpkgs.gnused}/bin/sed \
           -e "s|%%AIRPLAY_NAME%%|$AIRPLAY_NAME|" \
           -e "s|%%INTERPOLATION%%|$INTERPOLATION|" \
           -e "s|%%PASSWORD_LINE%%|$PASSWORD_LINE|" \
@@ -531,19 +786,4 @@ rec {
         chmod +x "$out"/etc/services.d/*/run
       '';
 
-  # Swap the stock, systemd-linked libdbus for the systemd-free one across
-  # the whole built tree at once. nixpkgs' own replaceDependencies rewrites
-  # references in an already-built closure without rebuilding any of it, so
-  # avahi and libpulseaudio keep their cache.nixos.org binaries instead of
-  # being overridden (which would compile both from source) - see the
-  # dbusNoSystemd notes above.
-  containerRoot = pkgs.replaceDependencies {
-    drv = containerRootUnpatched;
-    replacements = [
-      {
-        oldDependency = pkgs.dbus.lib;
-        newDependency = dbusNoSystemd.lib;
-      }
-    ];
-  };
 }
