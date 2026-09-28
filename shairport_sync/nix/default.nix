@@ -91,7 +91,7 @@
   # the upstream URL briefly 404'd while the fork's returned 200, then both
   # returned an identical 52828869-byte tarball a moment later. So a 404
   # here right after pushing means "wait", not "wrong URL".
-  nixpkgsRev ? "8894653cb54b428b9b953b3418496c8cf1f53330",
+  nixpkgsRev ? "16b0cbc9754e848a4ea46fccb9b511b7d0c9622b",
   pkgs ?
     import (builtins.fetchTarball "https://github.com/NixOS/nixpkgs/archive/${nixpkgsRev}.tar.gz")
       { },
@@ -291,8 +291,20 @@ let
       # decoder, encoder, muxer, demuxer, parser, protocol and filter - which
       # is why libavcodec.so alone is 15.6MB of the lib output.
       #
-      # shairport-sync needs exactly two decoders, both native: reading its
-      # sources it references only AV_CODEC_ID_AAC and AV_CODEC_ID_ALAC.
+      # shairport-sync needs three native decoders, established by reading its
+      # sources and then by watching a real session fail:
+      #   AV_CODEC_ID_AAC   - AirPlay 2 buffered audio;
+      #   AV_CODEC_ID_ALAC  - AirPlay 2 realtime audio and classic AirPlay 1;
+      #   AV_CODEC_ID_PCM_S16BE - classic AirPlay 1 senders that announce an
+      #     uncompressed L16/44100/2 stream instead of ALAC, which is what pyatv
+      #     (and so Home Assistant's own AirPlay media player) does.
+      # The PCM one is not reachable in shairport-sync 5.5.2 - it feeds L16 to the
+      # ALAC decoder, so every packet fails with AVERROR_INVALIDDATA and the output
+      # is dithered silence - but it becomes reachable as soon as the pinned
+      # nixpkgs carries upstream's fix (mikebrady/shairport-sync be30b6b2, applied
+      # as a patch in the pinned revision), which selects PCM_S16BE for those
+      # streams. Without it enabled here, --disable-everything would make
+      # avcodec_find_decoder return NULL and the fix would fail differently.
       # nixpkgs' ffmpeg exposes no extraConfigureFlags escape hatch, so this
       # is the one place an overrideAttrs is still required. Order matters
       # and works in our favour: appending puts --disable-everything after
@@ -304,7 +316,7 @@ let
       ffmpeg = (prev.ffmpeg-headless.override ffmpegTrimFlags).overrideAttrs (o: {
         configureFlags = (o.configureFlags or [ ]) ++ [
           "--disable-everything"
-          "--enable-decoder=aac,aac_fixed,alac"
+          "--enable-decoder=aac,aac_fixed,alac,pcm_s16be"
           "--enable-parser=aac"
         ];
       });

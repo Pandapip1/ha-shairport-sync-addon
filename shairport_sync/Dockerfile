@@ -83,7 +83,7 @@ FROM nixos/nix:2.35.2 AS builder
 # TEMPORARY: this revision currently exists only on a fork; GitHub serves
 # fork-network commits from the upstream archive URL (allow a short
 # propagation delay after pushing). See nix/default.nix for the options.
-ARG NIXPKGS_REV=8894653cb54b428b9b953b3418496c8cf1f53330
+ARG NIXPKGS_REV=16b0cbc9754e848a4ea46fccb9b511b7d0c9622b
 
 # Binary cache holding the overridden, codec-trimmed ffmpeg from
 # nix/default.nix. That override is deliberately not in cache.nixos.org
