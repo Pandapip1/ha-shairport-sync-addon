@@ -39,7 +39,8 @@ non-standard Docker registry.
   distro packages an AirPlay-2-capable binary. This gets real AirPlay 2
   support, at the cost of a much heavier on-device build - see
   `shairport_sync/DOCS.md` and the Dockerfile's own comments for the full
-  reasoning (including why this deliberately avoids `pkgsStatic`/musl).
+  reasoning (the Dockerfile explains, at the lines they apply to, why Nix's
+  build sandbox is disabled and why this avoids `pkgsStatic`/musl).
   The final image was still Alpine, with shairport-sync/nqptp's Nix store
   closure copied in - `avahi`/`dbus`/process supervision stayed on Alpine's
   `apk` packages and `s6-overlay`/`bashio`.

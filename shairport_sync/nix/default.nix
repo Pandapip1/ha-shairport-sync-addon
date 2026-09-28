@@ -71,7 +71,105 @@
 let
   inherit (pkgs) lib;
 
+  # --- Runtime-closure trimming (measured; see DOCS.md for before/after) ---
+  # shairport-sync depends on ffmpeg for AirPlay 2's AAC decoding, and that
+  # one dependency dominates this image: ffmpeg's `lib` output carries a
+  # 303MB closure of its own, including video encoders an audio-only
+  # AirPlay receiver can never reach (measured on aarch64: x265 12MB,
+  # libaom 8MB, libvpx 7MB, svt-av1 5MB, srt 7MB, plus mbedtls 15MB pulled
+  # in via srt/rist).
+  #
+  # Those codecs are dropped below by overriding them off, which cuts about
+  # 80MB from the runtime closure. The cost of doing so, measured rather
+  # than assumed: the override changes ffmpeg's derivation hash, so it is
+  # NOT in cache.nixos.org - verified by querying the override's own output
+  # path (404) against plain ffmpeg-headless (200). A device building this
+  # with only the default substituters would therefore compile ffmpeg from
+  # source, which is exactly what this repo's README warns about. That is
+  # why the overridden build is published to this project's own binary
+  # cache and the Dockerfile adds that cache as an extra substituter; see
+  # the `extra-substituters`/`extra-trusted-public-keys` lines there.
+  #
+  # Approach deliberately NOT taken: stripping these references off the
+  # already-built, cached ffmpeg with removeReferencesTo/nukeReferences.
+  # That is normally the right way to shrink a closure without giving up
+  # cache hits, but it cannot work here - `patchelf --print-needed
+  # libavcodec.so` lists libx265.so.216, libaom.so.3, libvpx.so.12,
+  # libSvtAv1Enc.so.4 and libx264.so.165 as real DT_NEEDED entries, so the
+  # dynamic loader genuinely needs those files present and removing the
+  # references would only make shairport-sync fail to start at runtime.
+  # Reference-stripping helps for paths that leak in as strings
+  # (pkg-config files, embedded build flags), not for actual dynamic links.
+  ffmpegAudioOnly = pkgs.ffmpeg-headless.override {
+    withX264 = false;
+    withX265 = false;
+    withVpx = false;
+    withAom = false;
+    withSvtav1 = false;
+    withDav1d = false;
+    withTheora = false;
+    withWebp = false;
+    withOpenjpeg = false;
+    withBluray = false;
+    withOpenmpt = false;
+    withSrt = false;
+    withRist = false;
+    withVidStab = false;
+    # Video capture: pulls v4l-utils, which was the last thing dragging
+    # systemd-minimal-libs into the closure (found with `nix why-depends`:
+    # containerRoot -> shairport-sync -> ffmpeg-lib -> v4l-utils ->
+    # systemd-minimal-libs).
+    withV4l2 = false;
+    # ALSA: this app outputs via PulseAudio only (enableAlsa = false on
+    # shairport-sync below), so ffmpeg's own ALSA support is dead weight.
+    withAlsa = false;
+    # GPU/hardware video paths - meaningless for an audio-only receiver.
+    withVulkan = false;
+    withVaapi = false;
+    withDrm = false;
+    withOpencl = false;
+    # Subtitle and text rendering (drawtext filter and friends).
+    withAss = false;
+    withFontconfig = false;
+    withFreetype = false;
+    withFribidi = false;
+    withHarfbuzz = false;
+    withZvbi = false;
+    # Remaining non-audio container/protocol extras.
+    withOpenapv = false;
+    withSsh = false;
+  };
+
+  # dbus's `enableSystemd` defaults on, which puts systemd-minimal (33MB)
+  # plus systemd-minimal-libs (5MB) into the runtime closure purely so dbus
+  # can do systemd service activation and journal logging. This image runs
+  # dbus under s6 with the activation directives deliberately stripped from
+  # system.conf (see dbusSystemConf below) and ships no systemd at all, so
+  # none of that is reachable at runtime.
+  dbusNoSystemd = pkgs.dbus.override { enableSystemd = false; };
+
+  # Overriding dbus for *our* daemon is not enough on its own: avahi (and
+  # libpulseaudio) link libdbus too, and `nix why-depends` showed
+  # systemd-minimal surviving via exactly that route -
+  # containerRoot -> avahi-0.8 -> dbus-1.16.2-lib (stock) -> systemd-minimal.
+  # Overriding each of those consumers would force avahi and libpulseaudio
+  # to rebuild from source; instead the stock libdbus is swapped out across
+  # the whole closure at the end with nixpkgs' own `replaceDependencies`
+  # (pkgs/build-support/replace-dependencies.nix), which rewrites an
+  # already-built tree's references with no rebuild at all. See the
+  # `containerRoot` definition at the bottom of this file.
+  # Its documented requirement - old and new dependency names must be the
+  # same length - holds here, since an override does not change the name
+  # (both are `dbus-1.16.2-lib`).
+
+  # The generated service `run` scripts are plain non-interactive shell
+  # scripts, but `pkgs.bash` is bash-interactive (confirmed by evaluating
+  # it: bash-interactive-5.3p15), which drags readline and ncurses along
+  # for ~19MB combined. bashNonInteractive is the same bash without them.
+  bash = pkgs.bashNonInteractive;
+
   shairportSync = pkgs.shairport-sync.override {
+    ffmpeg = ffmpegAudioOnly;
     enableAirplay2 = true;
     enableAvahi = true;
     enablePulse = true;
@@ -270,7 +368,7 @@ in
 rec {
   inherit shairportSync nqptpPkg;
 
-  containerRoot =
+  containerRootUnpatched =
     pkgs.runCommand "shairport-sync-container-root"
       {
         nativeBuildInputs = [ pkgs.findutils ];
@@ -281,7 +379,7 @@ rec {
         # --- Discover the real binary/config paths inside the already-built
         # avahi/dbus derivations, rather than guessing bin/ vs sbin/. ---
         AVAHI_DAEMON_BIN="$(find ${pkgs.avahi} -type f -name avahi-daemon | head -n1)"
-        DBUS_DAEMON_BIN="$(find ${pkgs.dbus} -type f -name dbus-daemon | head -n1)"
+        DBUS_DAEMON_BIN="$(find ${dbusNoSystemd} -type f -name dbus-daemon | head -n1)"
         if [ -z "$AVAHI_DAEMON_BIN" ] || [ -z "$DBUS_DAEMON_BIN" ]; then
           echo "ERROR: could not locate avahi-daemon or dbus-daemon binary in the built packages" >&2
           exit 1
@@ -346,7 +444,7 @@ rec {
 
         # --- dbus ---
         cat > "$out"/etc/services.d/dbus/run <<'RUNEOF'
-        #!${pkgs.bash}/bin/bash
+        #!${bash}/bin/bash
         set -e
         ${pkgs.coreutils}/bin/mkdir -p /run/dbus
         ${pkgs.coreutils}/bin/rm -f /run/dbus/pid
@@ -357,7 +455,7 @@ rec {
 
         # --- avahi (waits for dbus's socket) ---
         cat > "$out"/etc/services.d/avahi/run <<'RUNEOF'
-        #!${pkgs.bash}/bin/bash
+        #!${bash}/bin/bash
         set -e
         ${waitForFn}
         wait_for "dbus system bus" /run/dbus/system_bus_socket
@@ -375,7 +473,7 @@ rec {
 
         # --- nqptp (no dependencies - just needs to be up before shairport-sync) ---
         cat > "$out"/etc/services.d/nqptp/run <<'RUNEOF'
-        #!${pkgs.bash}/bin/bash
+        #!${bash}/bin/bash
         set -e
         echo "[nqptp] starting"
         exec ${lib.getExe pkgs.nqptp}
@@ -384,7 +482,7 @@ rec {
         # --- shairport-sync (waits for avahi, nqptp, and the Supervisor's
         # PulseAudio socket; renders its own config from /data/options.json) ---
         cat > "$out"/etc/services.d/shairport-sync/run <<'RUNEOF'
-        #!${pkgs.bash}/bin/bash
+        #!${bash}/bin/bash
         set -e
         ${waitForFn}
         wait_for "avahi" /run/avahi-daemon/pid
@@ -427,4 +525,20 @@ rec {
 
         chmod +x "$out"/etc/services.d/*/run
       '';
+
+  # Swap the stock, systemd-linked libdbus for the systemd-free one across
+  # the whole built tree at once. nixpkgs' own replaceDependencies rewrites
+  # references in an already-built closure without rebuilding any of it, so
+  # avahi and libpulseaudio keep their cache.nixos.org binaries instead of
+  # being overridden (which would compile both from source) - see the
+  # dbusNoSystemd notes above.
+  containerRoot = pkgs.replaceDependencies {
+    drv = containerRootUnpatched;
+    replacements = [
+      {
+        oldDependency = pkgs.dbus.lib;
+        newDependency = dbusNoSystemd.lib;
+      }
+    ];
+  };
 }

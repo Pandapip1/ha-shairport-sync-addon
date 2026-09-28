@@ -45,8 +45,12 @@ speaker that iPhones, iPads and Macs can stream to directly.
   neither applies on a real device with ordinary internet access), then run
   as a real container against a real PulseAudio server. That process found
   and fixed six real bugs that a read-only review had missed - see
-  `CHANGELOG.md`'s 3.0.0 entry for the list. Only two things remain
-  genuinely untested; see "What hasn't been tested" below.
+  `CHANGELOG.md`'s 3.0.0 entry for the list. It has **since also been
+  installed, built, started and stopped on a real Home Assistant OS 18.3
+  Supervisor through the Supervisor API**, which found a seventh bug that
+  made the app invisible in the Add-on Store entirely; see "Tested on a
+  real Home Assistant Supervisor" and "What still hasn't been tested"
+  below.
 - **The actual measured build cost turned out to be much smaller than
   originally expected.** Only `shairport-sync` itself (about 30 seconds)
   and the four small hand-written config files are compiled from source;
@@ -214,19 +218,64 @@ things came out of that specifically worth knowing:
   This is the closest this testing got to how the app actually behaves
   under Supervisor's `host_network: true` + `realtime: true` combination.
 
-Two things remain genuinely untested, because they need either a real HA
-Supervisor environment or a real AirPlay client, neither of which existed
-in the sandbox this was built in:
+### Tested on a real Home Assistant Supervisor
 
-- **Graceful shutdown under Supervisor.** The container-internal behavior
-  (s6-svscan supervising and restarting its children) was observed
-  directly, but how it responds to Supervisor's actual stop/restart
-  sequence (as opposed to a plain `docker stop` from this sandbox, which
-  was not separately timed) hasn't been.
+Since then this app has been installed and run on a **real Home Assistant
+OS 18.3 Supervisor** (`haos_generic-aarch64`, booted under QEMU/KVM on an
+aarch64 host, Supervisor 2026.09.2, Core 2026.9.4, machine `qemuarm-64`),
+driven through the actual Supervisor API rather than by hand. Confirmed
+there, by observing it happen:
+
+- **The repository adds and the app builds and installs.** Supervisor ran
+  its own `docker buildx build --platform linux/arm64` against this
+  `Dockerfile` and reported `successfully installed`. The build took
+  **5 minutes 41 seconds** and produced a **504 MB** image.
+- **`cache.nixos.org` is reachable from inside Supervisor's build
+  container** - the Nix build pulled prebuilt binaries normally, so no
+  proxy or egress special-casing is needed.
+- **`host_network: true` really does give this app the host's ports.**
+  Checked with `ss` on the HAOS host itself, not inside the container:
+  `nqptp` held real UDP 319 and 320, and `shairport-sync` was listening on
+  real TCP 7000.
+- **Avahi registered on the real host interfaces** (the HAOS host's
+  physical NIC plus its `hassio`/`docker0` bridges), reaching `Server
+  startup complete`, rather than on a container-private bridge.
+- **The options plumbing works end to end** - `shairport-sync` logged
+  `starting (AirPlay name: Home Assistant)`, i.e. it read Supervisor's
+  real `/data/options.json` through `jq` and rendered its own config.
+- **Graceful shutdown under Supervisor is fast.** Stopping the app through
+  Supervisor's own lifecycle took **269 ms** end to end (its log going
+  from `Stopping app_...` to `Cleaning app_...`), because `s6-svscan` as
+  PID 1 acts on `SIGTERM` promptly. This was previously the main untested
+  risk here, since a large `timeout` would only ever delay a `SIGKILL`.
+
+That process also found a real bug that no amount of local container
+testing could have caught: `config.yaml` had `timeout: 1800`, but
+Supervisor's schema caps `timeout` at **300**, so it rejected the entire
+config file and **the app never appeared in the Add-on Store at all** -
+while the repository itself loaded with no visible error. The only sign
+was a single Supervisor log line (`Can't read .../config.yaml: value must
+be at most 300 ... Got 1800`). See `CHANGELOG.md`.
+
+One correction to the build-cost numbers above, learned the same way:
+the *runtime closure* really is about 145 store paths / 343 MB as
+measured, but that is not the same as what a fresh install **downloads**.
+During the real Supervisor build the HAOS data partition grew by well
+over 2 GB, because Nix fetches each dependency's build closure too. Size
+the disk for the download, not for the final image.
+
+### What still hasn't been tested
+
 - **An actual AirPlay 2 connection from a real Apple device**, including
-  multi-room/"Add to Home app" pairing - the sandbox confirmed the RTSP
-  port is open and the daemon is alive, but had no iPhone/Mac/HomeKit
-  environment to actually stream to it from.
+  multi-room/"Add to Home app" pairing. The RTSP port is confirmed open on
+  the real host and the daemon confirmed alive and advertising, but there
+  was no iPhone/Mac/HomeKit environment to stream from. Note also that the
+  Supervisor test above ran under QEMU user-mode networking, which does
+  not carry LAN multicast, so real-client mDNS discovery specifically was
+  not exercised even though Avahi's own registration was.
+- **Real audio actually coming out of a speaker.** The PulseAudio path was
+  verified against a real PulseAudio server during container testing, but
+  the Supervisor test host had no physical audio output to play to.
 
 If you hit a problem with either of these, please open an issue.
 

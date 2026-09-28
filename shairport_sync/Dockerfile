@@ -24,10 +24,41 @@
 # checked into source control here, byte for byte, like any other file in
 # this repo, not written at image-build time by some external script.
 #
-# Why Nix's build sandbox is disabled and why pkgsStatic is avoided: see
-# nix/default.nix's own header comment and this repo's README/DOCS.md -
-# those decisions are unchanged from v2.0.0 and are documented once, at
-# the source of truth, rather than duplicated here.
+# WHY `sandbox = false` BELOW:
+# Nix's build sandbox needs to unshare mount/user namespaces and set up a
+# chroot. Supervisor builds apps with an unprivileged `docker buildx build`
+# (confirmed by reading the exact command Supervisor logs when installing
+# this app - no `--privileged`, no extra capabilities), where that setup
+# is not permitted, so leaving the sandbox on makes the build fail in the
+# one environment this Dockerfile actually has to work in.
+#
+# This is a constraint of *building inside Docker*, NOT a property of
+# nix/default.nix: the same `containerRoot` derivation was built natively
+# on an aarch64 NixOS host with `sandbox = true` (NixOS's default) and
+# succeeded, producing an identical 145-path / 343 MB runtime closure. So
+# the expression is sandbox-clean; only the container environment isn't.
+# The cost of disabling it is that builders here can see the host FS and
+# network, so Nix cannot *enforce* purity - it is enforced in practice by
+# the pinned NIXPKGS_REV plus the fact that essentially everything comes
+# prebuilt from cache.nixos.org.
+#
+# WHY NOT pkgsStatic:
+# pkgsStatic was originally wanted here for the obvious reason - a static
+# build would drop the ~343 MB glibc-based runtime closure this image
+# currently copies into /nix and make the final image dramatically
+# smaller. It was abandoned because something in this stack depends on
+# NSS: the image needs glibc's NSS "files" backend to resolve the
+# root/avahi users and netdev group that dbus's and avahi's own policy
+# files reference (see nix/default.nix's NSS notes - missing NSS files
+# were one of the 3.0.0 bugs). NSS resolves those by dlopen()ing
+# libnss_files at runtime, which a fully static binary cannot do, so
+# going static would reintroduce exactly that failure. The image size is
+# the price paid for that; it is not an oversight.
+#
+# (Earlier versions of this file claimed both rationales were documented
+# in nix/default.nix and the README/DOCS.md. They were not - the README
+# pointed back here and neither explained either decision. Written down
+# properly here now, at the line it actually applies to.)
 # ==============================================================================
 FROM nixos/nix:2.35.2 AS builder
 
@@ -35,11 +66,30 @@ FROM nixos/nix:2.35.2 AS builder
 # here so both stay traceably in sync with a single source (this ARG).
 ARG NIXPKGS_REV=55d33a38f82193676603b4b58572b8718d6623b7
 
+# Binary cache holding the overridden, codec-trimmed ffmpeg from
+# nix/default.nix. That override is deliberately not in cache.nixos.org
+# (changing ffmpeg's arguments changes its derivation hash), so WITHOUT a
+# substituter that has it, every single install compiles ffmpeg from
+# source - including running its test suite. With it, the whole closure is
+# a ~37MB download. cache.nixos.org is still consulted for everything
+# else; these are *extra* substituters, not a replacement.
+#
+# TEMPORARY/TEST VALUES: this currently points at a throwaway local cache
+# used to validate the mechanism end to end against a real Supervisor.
+# Replace both with the project's real cache before publishing.
+ARG NIX_CACHE_URL=http://10.0.2.2:8899
+ARG NIX_CACHE_PUBKEY=shairport-test-cache:Y/xXjBgKsh7Op4543lbXK8dL+1AfK/WNc/iP/LKApm8=
+
 RUN mkdir -p /etc/nix \
     && { \
         echo "sandbox = false"; \
         echo "experimental-features = nix-command"; \
+        echo "extra-substituters = ${NIX_CACHE_URL}"; \
+        echo "extra-trusted-public-keys = ${NIX_CACHE_PUBKEY}"; \
+        echo "fallback = true"; \
     } >> /etc/nix/nix.conf
+# `fallback = true` above: if the extra cache is unreachable, build from
+# source instead of failing the install outright.
 
 COPY nix/default.nix /build/default.nix
 

@@ -32,7 +32,12 @@ boot: auto
 # data['timeout']", which made the app silently invisible in the Add-on
 # Store (the repository loaded fine, the app just never appeared) - found
 # by actually installing this on a real HAOS Supervisor.
-timeout: 300
+# 30 is deliberate headroom over the measured cost: stopping this app via
+# Supervisor's own lifecycle took 269ms end to end (its log going from
+# "Stopping app_..." to "Cleaning app_...") on real HAOS 18.3, because
+# s6-svscan as PID 1 does act on SIGTERM promptly. A large value here
+# would only delay the SIGKILL if it ever did hang.
+timeout: 30
 
 # Maps Supervisor's working PulseAudio setup into the container so shairport-sync
 # can output to whatever sink the host (e.g. the 3.5mm jack) is using.
