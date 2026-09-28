@@ -2,62 +2,63 @@
 
 ## Unreleased
 
-- **Fixes an app-breaking bug found only on a real Supervisor:**
-  `config.yaml` had `timeout: 1800`, but Supervisor's schema caps `timeout`
-  at 300. It therefore rejected the whole config file and **the app never
-  appeared in the Add-on Store at all**, while the repository itself loaded
-  with no visible error - the only trace was one Supervisor log line
-  (`Can't read .../config.yaml: value must be at most 300 ... Got 1800`).
-  `timeout` is now 30, chosen from measurement rather than guesswork: a
-  real Supervisor stop takes ~220-270ms, so a large value would only ever
-  delay a `SIGKILL`. The old comment's premise was also wrong - `timeout`
-  is the graceful-stop window, not a build timeout.
-- **Runtime closure cut from 145 store paths / 343 MB to 75 paths /
-  178 MB, and the image from 504 MB to 259 MB** (~49% smaller), measured
-  with `nix path-info -S` and `docker images`:
-  - shairport-sync's `ffmpeg` dependency was pulling video encoders
-    (x265, libaom, libvpx, svt-av1), `srt`+`mbedtls`, `v4l-utils`, ALSA,
-    Vulkan/VAAPI/DRM/OpenCL and a subtitle/text-rendering stack, none of
-    which an audio-only AirPlay receiver can reach. All disabled.
-  - `dbus` is built with `enableSystemd = false`, dropping
-    `systemd-minimal` + `systemd-minimal-libs` (38 MB) that existed only
-    for systemd activation and journal logging.
-  - `pkgs.bash` is `bash-interactive`; switched to `bashNonInteractive`,
-    dropping readline and ncurses (~19 MB) from an image whose only shell
-    scripts are non-interactive.
-  - The dbus change alone was insufficient: avahi and libpulseaudio link
-    libdbus too, and `nix why-depends` showed systemd surviving via
-    `containerRoot -> avahi -> dbus-lib(stock) -> systemd-minimal`.
-    Rather than override those consumers - which would compile avahi and
-    libpulseaudio from source - the stock libdbus is swapped across the
-    whole built tree with nixpkgs' own `replaceDependencies`, rewriting an
-    already-built closure with no rebuild at all (4 seconds).
-  - Not done with `removeReferencesTo`/`nukeReferences` despite that being
-    the cache-preserving approach: `patchelf --print-needed libavcodec.so`
-    shows libx265/libaom/libvpx/libSvtAv1Enc/libx264 as real `DT_NEEDED`
-    entries, so dropping those references would break loading rather than
-    slim anything.
-- **Adds this project's binary cache as an extra substituter.** The ffmpeg
-  override is not in `cache.nixos.org` (confirmed by querying it), so
-  without this every install compiles ffmpeg from source and runs its test
-  suite. `fallback = true` means an unreachable cache degrades to a slow
-  build rather than a failed install.
-- Documents, at the lines they apply to, why the Nix build sandbox is
-  disabled and why `pkgsStatic` is avoided. Both were previously claimed to
-  be documented elsewhere, but the README pointed back at the Dockerfile
-  and neither explained either decision. The sandbox is disabled only
-  because Supervisor builds apps with an unprivileged `docker buildx
-  build`; the same derivation builds fine with `sandbox = true` on a NixOS
-  host, so the expression itself is sandbox-clean.
-- Verified on a real Home Assistant OS 18.3 Supervisor (aarch64, Core
-  2026.9.4) via the Supervisor API: repository add, build, install, start,
-  stop and uninstall; `nqptp` holding the real host's UDP 319/320 and
-  shairport-sync the real host's TCP 7000; avahi registering on the real
-  host interfaces; options read from Supervisor's own `options.json`. The
-  `replaceDependencies` rewrite was checked not to have broken linking -
-  `avahi-daemon`, `dbus-daemon` and `shairport-sync` all report zero
-  unresolved libraries and resolve `libdbus-1.so.3` to the systemd-free
-  build. See DOCS.md.
+- **Fixes an app-breaking bug only a real Supervisor could find:**
+  `config.yaml` had `timeout: 1800`, but Supervisor's schema caps `timeout` at
+  300, so it rejected the whole config file and **the app never appeared in
+  the Add-on Store**, while the repository itself loaded with no visible
+  error - the only trace was one log line (`Can't read .../config.yaml: value
+  must be at most 300 ... Got 1800`). Now 30, chosen from measurement: a real
+  Supervisor stop takes 0.21 s, so a larger value would only delay a
+  `SIGKILL`. The old comment's premise was also wrong - `timeout` is the
+  graceful-stop window, not a build timeout.
+- **The whole image is now built against musl**, not glibc, and the runtime
+  closure went from 145 store paths / 343 MB to **37 paths / 49.8 MB**, with
+  the image down from 504 MB to **53 MB**:
+  - glibc's store path is 47 MB, of which only ~5 MB is libraries actually
+    loaded; musl's whole closure is 4 MB. Safe here because what this image
+    needs is `getpwnam`/`getgrnam` over its own `/etc/passwd` and
+    `/etc/group`, not pluggable NSS modules. Dynamic rather than `pkgsStatic`,
+    since four daemons would otherwise each get a copy of every shared
+    dependency.
+  - ffmpeg is trimmed additively via `withHeadlessDeps = false` plus only the
+    four libraries shairport-sync's `DT_NEEDED` names, so anything nixpkgs
+    later adds to its dependency tiers stays off rather than reappearing.
+    With `--disable-everything` and three decoders re-enabled, `libavcodec.so`
+    drops from 15.6 MB to 1.01 MB.
+  - CPython is `withMinimalDeps` plus zlib, expat and libffi, which takes the
+    build plan from 79 derivations to 36. It is build-time only - `nix-store
+    -qR` on the container root matches zero python paths.
+  - `dbus` drops systemd, X11, AppArmor, audit and libcap-ng; `libcap` drops
+    pam_cap; `flac` drops its doc toolchain; `speexdsp` drops fftw (which
+    needs gfortran, which does not build under musl at all); `avahi` and
+    `libpulseaudio` drop their glib binding libraries, and with them glib
+    (17 MB) and dconf; `bash` becomes `bashNonInteractive`.
+- **Enables ffmpeg's `pcm_s16be` decoder.** Senders that negotiate
+  uncompressed L16 rather than ALAC - pyatv, and so Home Assistant's own
+  AirPlay media player - were played as silence: shairport-sync detected the
+  PCM stream and then decoded it as ALAC, failing every packet with
+  `AVERROR_INVALIDDATA`. That is an upstream bug, fixed in
+  mikebrady/shairport-sync `be30b6b2` and backported in the pinned revision;
+  the fix routes L16 through ffmpeg's PCM decoder, which
+  `--disable-everything` would otherwise have removed.
+- **Requires this project's binary cache.** Nothing in a musl build of this
+  stack is in `cache.nixos.org`, so without it every install compiles the
+  whole stack. With it the closure is a 9.8 MiB download and nothing compiles
+  at all. `fallback = true` keeps an unreachable cache slow rather than fatal.
+- **Verified on a real Home Assistant OS 18.3 Supervisor** (aarch64,
+  Supervisor 2026.09.2, Core 2026.9.4) through the Supervisor API: repository
+  add, build, install, start, stop, uninstall; **real audio playback** - a
+  440 Hz tone from a real AirPlay sender measured back at 439 Hz and full
+  scale off the PulseAudio sink monitor; AirPlay 2 `GET /info` and HomeKit
+  transient pair-setup both completing; `_airplay._tcp` and `_raop._tcp`
+  resolving with full TXT records on every interface; nqptp holding the real
+  host's UDP 319/320 and shairport-sync its TCP 7000; and graceful shutdown in
+  0.21 s with exit code 0.
+- Documents why the Nix build sandbox is disabled and why `pkgsStatic` is
+  avoided, at the lines they apply to. Both were previously claimed to be
+  documented elsewhere and were not.
+- Trims the commentary in `nix/default.nix` and the `Dockerfile` down to what
+  a reader could not derive from the code, moving the history here.
 
 ## 3.0.0
 
